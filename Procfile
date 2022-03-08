@@ -1,1 +1,1 @@
-web: periplus-search
+web: main
