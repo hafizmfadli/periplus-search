@@ -103,6 +103,6 @@ func main(){
 		w.Write(jsonResponse)
 	})
 
-	fmt.Println("Listening to port : " + port)
-	http.ListenAndServe(":" + port, r)
+	fmt.Println("Listening to port : " + "3000")
+	http.ListenAndServe(":3000" + port, r)
 }
