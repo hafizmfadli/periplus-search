@@ -9,37 +9,27 @@ import (
 	"github.com/elastic/go-elasticsearch/v7"
 )
 
-// Document wraps an periplus product
+type Contributor struct {
+	ID   int    `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+	Role string `json:"role,omitempty"`
+}
+
+// Document wraps an periplus book
 type Document struct {
-	ID             int    `json:"id,omitempty"`
-	FirstAuthor    string `json:"first_author,omitempty"`
-	SecondAuthor   string `json:"second_author,omitempty"`
-	ThirdAuthor    string `json:"third_author,omitempty"`
-	ISBN           string `json:"isbn,omitempty"`
-	Title          string `json:"title,omitempty"`
-	ImgUrl         string `json:"img_url,omitempty"`
-	AuthorsSuggest string `json:"authors_suggest,omitempty"`
-	TitleSuggest   string `json:"title_suggest,omitempty"`
+	ID           string           `json:"id,omitempty"`
+	Name        string        `json:"name,omitempty"`
+	ImgUrl       string        `json:"img_url,omitempty"`
+	Contributors []Contributor `json:"contributors,omitempty"`
 }
 
 type SearchResults struct {
-	// Total int    `json:"total"`
-	// Hits  []*Hit `json:"hits"`
-	Took int64 `json:"took,omitempty"`
-	Hits struct {
-		Total struct {
-			Value int64 `json:"value,omitempty"`
-		} `json:"total,omitempty"`
-		Hits []Hit `json:"hits,omitempty"`
-	} `json:"hits,omitempty"`
+	Total int    `json:"total"`
+	Hits  []*Hit `json:"hits"`
 }
 
 type Hit struct {
-	Doc        Document `json:"_source,omitempty"`
-	Highlights struct {
-		AuthorsSuggest []string `json:"authors_suggest,omitempty"`
-		TitleSuggest   []string `json:"title_suggest,omitempty"`
-	} `json:"highlight,omitempty"`
+	Document
 }
 
 // StoreConfig configures the store
@@ -58,7 +48,7 @@ type Store struct {
 func NewStore(c StoreConfig) (*Store, error) {
 	indexName := c.IndexName
 	if indexName == "" {
-		indexName = "products"
+		indexName = "products_v6"
 	}
 
 	s := Store{es: c.Client, indexName: c.IndexName}
@@ -93,13 +83,21 @@ func (s *Store) Exists(id string) (bool, error) {
 	}
 }
 
-func (s *Store) SearchAutocomplete (keyword string) (*SearchResults, error){
+func (s *Store) SearchAutocomplete (keyword string, filter int) (*SearchResults, error){
 	var results SearchResults
+
+	var q io.Reader
+	if filter > 0 {
+		q = s.BuildQuery(filter, keyword)
+	}else {
+		q = s.BuildQuery(-1, keyword)
+	}
 
 	res, err := s.es.Search(
 		s.es.Search.WithIndex(s.indexName),
-		s.es.Search.WithBody(s.buildQuery(autoComplete, keyword)),
+		s.es.Search.WithBody(q),
 	)
+	
 	if err != nil {
 		return &results, err
 	}
@@ -113,48 +111,117 @@ func (s *Store) SearchAutocomplete (keyword string) (*SearchResults, error){
 		return &results, fmt.Errorf("[%s] %s: %s", res.Status(), e["error"].(map[string]interface{})["type"], e["error"].(map[string]interface{})["reason"])
 	}
 
-	if err := json.NewDecoder(res.Body).Decode(&results); err != nil {
-		return &results, err
+	type envelopeResponse struct {
+		Took int
+		Hits struct {
+			Total struct {
+				Value int
+			}
+			Hits []struct {
+				ID         string          `json:"_id"`
+				Source     json.RawMessage `json:"_source"`
+			}
+		}
 	}
-	
+
+	var r envelopeResponse
+	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
+		return &results, nil
+	}
+
+	results.Total = r.Hits.Total.Value
+
+	if len(r.Hits.Hits) < 1 {
+		results.Hits = []*Hit{}
+		return &results, nil
+	}
+
+	for _, hit := range r.Hits.Hits {
+		var h Hit
+		h.ID = hit.ID
+		
+		if err := json.Unmarshal(hit.Source, &h); err != nil {
+			return &results, err
+		}
+
+		results.Hits = append(results.Hits, &h)
+	}
+
 	return &results, nil
 }
 
-func (s *Store) buildQuery(queryTemplate, queryValue string) io.Reader {
+func (s *Store) BuildQuery(filter int, query string) io.Reader {
 	var b strings.Builder
 
-	if queryTemplate == "" {
-		b.WriteString(searchAll)
-	}else {
-		b.WriteString(fmt.Sprintf(queryTemplate, queryValue))
+	if filter > 0 {
+		b.WriteString(fmt.Sprintf(autoCompleteWithFilter, filter, query))
+	} else {
+		b.WriteString(fmt.Sprintf(autoComplete, query))
 	}
-
+	// fmt.Println(b.String())
 	return strings.NewReader(b.String())
 }
 
-const searchAll = `
-	"query" : { "match_all" : {} },
-	"size" : 10
-`
-
-const autoComplete = `
-{
+const autoComplete =
+`{
   "query": {
-    "multi_match": {
-      "query": %q,
-      "type": "cross_fields", 
-      "fields": ["title_suggest", "authors_suggest"],
-      "operator": "and"
-    }
-  },
-  "highlight": {
-    "fields": {
-      "title_suggest": {},
-      "authors_suggest": {}
+    "bool": {
+      "must": [
+        {
+          "multi_match": {
+            "query": %q,
+            "type": "most_fields",
+            "fields": [
+              "type_search",
+              "type_search._2gram",
+              "type_search._3gram",
+              "type_search._index_prefix"
+            ],
+            "fuzziness": 1,
+            "prefix_length": 3,
+            "max_expansions": 10
+          }
+        }
+      ]
     }
   }
 }
 `
 
-
-
+const autoCompleteWithFilter =
+`{
+  "query": {
+    "bool": {
+      "must": [
+        {"nested": {
+          "path": "categories",
+          "query": {
+            "bool": {
+             "must": [
+               {"match": {
+                 "categories.id": %d
+               }}
+             ] 
+            }
+          }
+        }},
+        {
+          "multi_match": {
+            "query": %q,
+            "type": "most_fields",
+            "fields": [
+              "type_search",
+              "type_search._2gram",
+              "type_search._3gram",
+              "type_search._index_prefix"
+            ],
+            "fuzziness": 1,
+            "prefix_length": 3,
+            "max_expansions": 10
+          }
+        }
+      ]
+    }
+  }
+}
+`
